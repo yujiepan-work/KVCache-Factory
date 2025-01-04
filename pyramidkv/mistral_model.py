@@ -2603,7 +2603,7 @@ def mistral_flash_attn2_forward_SnapKV(
 
     return attn_output, attn_weights, past_key_value
 
-def mistral_flash_attn2_forward_HeadKV(
+def mistral_flash_attn2_forward_AdaKV(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -2611,6 +2611,7 @@ def mistral_flash_attn2_forward_HeadKV(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ):  
     init_adakv(self)
@@ -2632,14 +2633,7 @@ def mistral_flash_attn2_forward_HeadKV(
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     
     kv_seq_len = key_states.shape[-2]
-    # if past_key_value is not None:
-    #     if self.layer_idx is None:
-    #         raise ValueError(
-    #             f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-    #             "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-    #             "with a layer index."
-    #         )
-    #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
     if past_key_value is not None:
         if self.layer_idx is None:
             raise ValueError(
@@ -2651,27 +2645,20 @@ def mistral_flash_attn2_forward_HeadKV(
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
-                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                # kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                kv_seq_len += cache_position[0]
         else:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += cache_position[0]
 
     # Because the input can be padded, the absolute sequence length depends on the max position id.
-    rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-    cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
+    # rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
+    # cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    use_sliding_windows = (
-        _flash_supports_window_size
-        and getattr(self.config, "sliding_window", None) is not None
-        and kv_seq_len > self.config.sliding_window
-    )
-
-    if not _flash_supports_window_size:
-        logger.warning_once(
-            "The current flash attention version does not support sliding window attention, for a more memory efficient implementation"
-            " make sure to upgrade flash-attn library."
-        )
     # repeat k/v heads if n_kv_heads < n_heads
     # [SnapKV] move to ahead
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -2713,7 +2700,9 @@ def mistral_flash_attn2_forward_HeadKV(
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
                 # Handle the case where the model is quantized
-                if hasattr(self.config, "_pre_quantization_dtype"):
+                if torch.is_autocast_enabled():
+                    target_dtype = torch.get_autocast_gpu_dtype()
+                elif hasattr(self.config, "_pre_quantization_dtype"):
                     target_dtype = self.config._pre_quantization_dtype
                 else:
                     target_dtype = self.q_proj.weight.dtype
@@ -2731,16 +2720,19 @@ def mistral_flash_attn2_forward_HeadKV(
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
-            attn_output = self._flash_attention_forward(
+            attn_output = _flash_attention_forward(
                 query_states,
                 key_states,
                 value_states,
                 attention_mask,
                 q_len,
+                position_ids=position_ids,
                 dropout=dropout_rate,
-                use_sliding_windows=use_sliding_windows,
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
             )
-            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+            # attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
 
         else:
             self.kv_seq_len += q_len
@@ -2755,9 +2747,9 @@ def mistral_flash_attn2_forward_HeadKV(
             self.kv_cluster.cu_klen += self.kv_cluster.cu_offset
             self.kv_cluster.head_lens += 1
 
-            query_states = query_states.view(-1, 1, self.head_dim)
-            key_states = key_states.view(-1,1,self.head_dim)
-            value_states = value_states.view(-1,1,self.head_dim)
+            query_states = query_states.reshape(-1, 1, self.head_dim)
+            key_states = key_states.reshape(-1,1,self.head_dim)
+            value_states = value_states.reshape(-1,1,self.head_dim)
 
             cu_seqlens_q = self.kv_cluster.cu_qlen
             cu_seqlens_k = self.kv_cluster.cu_klen
@@ -2767,7 +2759,8 @@ def mistral_flash_attn2_forward_HeadKV(
             attn_output = flash_attn_varlen_func(query_states, key_states, value_states, cu_seqlens_q,
                                                  cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True).reshape(
                 bsz, self.num_heads, q_len, self.head_dim)
-            attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.hidden_size)
+            # attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.hidden_size)
+            attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
 
     attn_output = self.o_proj(attn_output)
 
@@ -2784,6 +2777,7 @@ def mistral_flash_attn2_forward_HeadKV(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ):  
     init_headkv(self)
@@ -2805,14 +2799,7 @@ def mistral_flash_attn2_forward_HeadKV(
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     
     kv_seq_len = key_states.shape[-2]
-    # if past_key_value is not None:
-    #     if self.layer_idx is None:
-    #         raise ValueError(
-    #             f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-    #             "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-    #             "with a layer index."
-    #         )
-    #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
     if past_key_value is not None:
         if self.layer_idx is None:
             raise ValueError(
@@ -2824,27 +2811,20 @@ def mistral_flash_attn2_forward_HeadKV(
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
-                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                # kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                kv_seq_len += cache_position[0]
         else:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += cache_position[0]
 
     # Because the input can be padded, the absolute sequence length depends on the max position id.
-    rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-    cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
+    # rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
+    # cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    use_sliding_windows = (
-        _flash_supports_window_size
-        and getattr(self.config, "sliding_window", None) is not None
-        and kv_seq_len > self.config.sliding_window
-    )
-
-    if not _flash_supports_window_size:
-        logger.warning_once(
-            "The current flash attention version does not support sliding window attention, for a more memory efficient implementation"
-            " make sure to upgrade flash-attn library."
-        )
     # repeat k/v heads if n_kv_heads < n_heads
     # [SnapKV] move to ahead
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -2878,15 +2858,19 @@ def mistral_flash_attn2_forward_HeadKV(
                 attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
         dropout_rate = 0.0 if not self.training else self.attention_dropout
         cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        # print(f'{key_states.shape[-2]} -- {kv_seq_len} -- {cache_position[0]}')
         if key_states.shape[-2] == kv_seq_len: # [SnapKV] add kv_cluster
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states)
+            # print(key_states_compress.shape)
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
 
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
                 # Handle the case where the model is quantized
-                if hasattr(self.config, "_pre_quantization_dtype"):
+                if torch.is_autocast_enabled():
+                    target_dtype = torch.get_autocast_gpu_dtype()
+                elif hasattr(self.config, "_pre_quantization_dtype"):
                     target_dtype = self.config._pre_quantization_dtype
                 else:
                     target_dtype = self.q_proj.weight.dtype
@@ -2904,16 +2888,19 @@ def mistral_flash_attn2_forward_HeadKV(
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
-            attn_output = self._flash_attention_forward(
+            attn_output = _flash_attention_forward(
                 query_states,
                 key_states,
                 value_states,
                 attention_mask,
                 q_len,
+                position_ids=position_ids,
                 dropout=dropout_rate,
-                use_sliding_windows=use_sliding_windows,
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
             )
-            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+            # attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
 
         else:
             self.kv_seq_len += q_len
@@ -2928,9 +2915,9 @@ def mistral_flash_attn2_forward_HeadKV(
             self.kv_cluster.cu_klen += self.kv_cluster.cu_offset
             self.kv_cluster.head_lens += 1
 
-            query_states = query_states.view(-1, 1, self.head_dim)
-            key_states = key_states.view(-1,1,self.head_dim)
-            value_states = value_states.view(-1,1,self.head_dim)
+            query_states = query_states.reshape(-1, 1, self.head_dim)
+            key_states = key_states.reshape(-1,1,self.head_dim)
+            value_states = value_states.reshape(-1,1,self.head_dim)
 
             cu_seqlens_q = self.kv_cluster.cu_qlen
             cu_seqlens_k = self.kv_cluster.cu_klen
@@ -2940,7 +2927,8 @@ def mistral_flash_attn2_forward_HeadKV(
             attn_output = flash_attn_varlen_func(query_states, key_states, value_states, cu_seqlens_q,
                                                  cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True).reshape(
                 bsz, self.num_heads, q_len, self.head_dim)
-            attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.hidden_size)
+            # attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.hidden_size)
+            attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
 
     attn_output = self.o_proj(attn_output)
 
@@ -2948,6 +2936,7 @@ def mistral_flash_attn2_forward_HeadKV(
         attn_weights = None
 
     return attn_output, attn_weights, past_key_value
+
 
 def adaptive_MistralModel_forward(
     self,
@@ -2991,11 +2980,6 @@ def adaptive_MistralModel_forward(
     ):  # kept for BC (non `Cache` `past_key_values` inputs)
         # return_legacy_cache = True  #! For 4.41 version.
         past_key_values = DynamicCacheSplitHeadFlatten.from_legacy_cache(past_key_values)
-        return_legacy_cache = True
-        logger.warning_once(
-            "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
-            "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
-        )
 
     if cache_position is None:
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -3082,6 +3066,11 @@ def prepare_inputs_for_generation_mistral_new(
         use_cache=True,
         **kwargs,
     ):
+
+        if not isinstance(past_key_values, tuple):
+            if len(past_key_values.key_cache) == 0:
+                for layer in self.model.layers:
+                    layer.self_attn.kv_seq_len = 0
         # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
         # Exception 1: when passing input_embeds, input_ids may be missing entries
         # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
